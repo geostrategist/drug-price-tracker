@@ -138,7 +138,7 @@ def _download(force_fresh: bool = False) -> bytes:
             # Case 1: got CSV directly
             if _is_csv_content(data):
                 cache.write_bytes(data)
-                logger.info("  ✓ CSV downloaded")
+                logger.info("  CSV downloaded OK")
                 return data
 
             # Case 2: got JSON metadata with a download URL
