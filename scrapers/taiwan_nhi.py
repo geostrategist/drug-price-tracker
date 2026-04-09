@@ -28,10 +28,10 @@ NHI_META_URL = (
 )
 # Direct download attempts (try each in order)
 NHI_DIRECT_URLS = [
-    # data.nhi.gov.tw direct download
-    "https://data.nhi.gov.tw/Datasets/Download.ashx?rid=A21030000I-E41001-001&l=0",
-    # info.nhi.gov.tw API
+    # info.nhi.gov.tw – confirmed working (UTF-8 BOM, ~95 MB)
     "https://info.nhi.gov.tw/api/iode0000s01/Dataset?rId=A21030000I-E41001-001",
+    # data.nhi.gov.tw direct download (may be unavailable outside Taiwan)
+    "https://data.nhi.gov.tw/Datasets/Download.ashx?rid=A21030000I-E41001-001&l=0",
     # data.gov.tw direct
     "https://data.gov.tw/api/v2/rest/dataset/23715",
 ]
@@ -43,16 +43,28 @@ HEADERS = {
 }
 
 COL_ALIASES = {
+    # Chinese name
     "中文品名": "name_zh", "中文藥品名稱": "name_zh", "藥品中文名稱": "name_zh",
+    # English name
     "英文品名": "name_en", "英文藥品名稱": "name_en", "藥品英文名稱": "name_en",
     "藥品名稱": "name_en",
+    # Generic / ingredient
     "一般名稱": "generic_name", "成分名": "generic_name", "學名": "generic_name",
+    "成份": "generic_name", "成分": "generic_name",           # ← actual NHI column
+    # ATC
     "atc碼": "atc_code", "atc_code": "atc_code", "atc": "atc_code",
+    "atc代碼": "atc_code",                                    # ← actual NHI column
+    # Price (TWD)
     "健保支付價格": "price_twd", "支付價格": "price_twd",
+    "支付價": "price_twd",                                    # ← actual NHI column
     "健保價": "price_twd", "藥價": "price_twd", "price": "price_twd",
+    # Dosage form
     "劑型": "dosage_form", "藥品劑型": "dosage_form",
-    "規格": "strength", "藥品規格": "strength",
+    # Strength
+    "規格": "strength", "藥品規格": "strength", "規格量": "strength",
+    # Manufacturer
     "製造廠": "manufacturer", "藥商名稱": "manufacturer", "廠商名稱": "manufacturer",
+    "製造廠名稱": "manufacturer",                             # ← actual NHI column
 }
 
 
@@ -107,35 +119,45 @@ def _download(force_fresh: bool = False) -> bytes:
     for url in NHI_DIRECT_URLS:
         try:
             logger.info("  trying: %s", url)
-            resp = requests.get(url, headers=HEADERS, timeout=60, allow_redirects=True)
+            # Stream download to handle large file (~95 MB)
+            resp = requests.get(url, headers=HEADERS, timeout=120,
+                                allow_redirects=True, stream=True)
             resp.raise_for_status()
-            data = resp.content
-            logger.info("  got %d bytes, content-type: %s", len(data), resp.headers.get("content-type", "?"))
+
+            chunks = []
+            total = 0
+            for chunk in resp.iter_content(chunk_size=512 * 1024):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total % (10 * 1024 * 1024) < 512 * 1024:
+                    logger.info("  downloaded %.0f MB …", total / 1024 / 1024)
+            data = b"".join(chunks)
+            logger.info("  total %.1f MB, content-type: %s",
+                        len(data) / 1024 / 1024, resp.headers.get("content-type", "?"))
 
             # Case 1: got CSV directly
             if _is_csv_content(data):
                 cache.write_bytes(data)
-                logger.info("  ✓ downloaded CSV directly")
+                logger.info("  ✓ CSV downloaded")
                 return data
 
             # Case 2: got JSON metadata with a download URL
             dl_url = _try_extract_download_url(data)
             if dl_url:
-                logger.info("  found download URL in JSON: %s", dl_url)
-                resp2 = requests.get(dl_url, headers=HEADERS, timeout=60, allow_redirects=True)
+                logger.info("  following metadata URL: %s", dl_url)
+                resp2 = requests.get(dl_url, headers=HEADERS, timeout=120,
+                                     allow_redirects=True, stream=True)
                 resp2.raise_for_status()
-                data2 = resp2.content
+                data2 = b"".join(resp2.iter_content(512 * 1024))
                 if _is_csv_content(data2):
                     cache.write_bytes(data2)
-                    logger.info("  ✓ downloaded CSV via metadata URL")
                     return data2
-                logger.warning("  metadata URL also didn't return CSV")
             else:
-                logger.warning("  not CSV and no download URL found; preview: %s",
-                               data[:200].decode("utf-8", errors="replace"))
+                logger.warning("  not CSV, preview: %s",
+                               data[:300].decode("utf-8", errors="replace"))
 
         except Exception as e:
-            logger.warning("  failed: %s — %s", url, e)
+            logger.warning("  failed (%s): %s", url, e)
             last_err = e
 
     raise RuntimeError(f"All NHI URLs failed. Last: {last_err}")
@@ -197,6 +219,22 @@ def fetch(conn: sqlite3.Connection) -> None:
 
     has_name  = "name_zh" in df.columns or "name_en" in df.columns
     has_price = "price_twd" in df.columns
+
+    # Positional fallback: NHI CSV has stable column order
+    # [0]異動 [1]藥品代號 [2]英文名 [3]中文名 [4]成份 [5]規格量 [6]規格單位
+    # [7]單複方 [8]支付價 [9]有效起日 [10]有效迄日 [11]藥廠 [12]製造廠名稱
+    # [13]劑型 [14]藥品分類 [15]分類分組名稱 [16]ATC代碼
+    if not has_name and len(df.columns) >= 9:
+        logger.warning("Column name match failed; using positional fallback")
+        cols = list(df.columns)
+        pos_map = {cols[2]: "name_en", cols[3]: "name_zh",
+                   cols[4]: "generic_name", cols[8]: "price_twd"}
+        if len(cols) > 12: pos_map[cols[12]] = "manufacturer"
+        if len(cols) > 13: pos_map[cols[13]] = "dosage_form"
+        if len(cols) > 16: pos_map[cols[16]] = "atc_code"
+        df = df.rename(columns=pos_map)
+        has_name  = "name_zh" in df.columns or "name_en" in df.columns
+        has_price = "price_twd" in df.columns
 
     if not has_name or not has_price:
         logger.error(
