@@ -1,0 +1,15 @@
+# Database (auto-generated, not committed)
+drug_prices.db
+
+# Downloaded data cache
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS
+.DS_Store
+Thumbs.db
