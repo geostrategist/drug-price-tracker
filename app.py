@@ -11,6 +11,7 @@ Sidebar controls:
   - PPP settings (α, exchange rate)
 """
 import logging
+import io
 
 import pandas as pd
 import plotly.express as px
@@ -20,7 +21,13 @@ import db
 import ppp as ppp_module
 from scrapers import japan_mhlw, who_ems, oecd_health, worldbank_gdp, taiwan_nhi
 
-logging.basicConfig(level=logging.WARNING)
+# Capture scraper logs so we can show them in the UI
+log_stream = io.StringIO()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(log_stream)],
+)
 
 # ── page config ───────────────────────────────────────────────────────────────
 
@@ -92,6 +99,8 @@ def _search(q: str) -> pd.DataFrame:
 
 def _run_scraper(key: str) -> None:
     label, fn = SCRAPERS[key]
+    log_stream.truncate(0)
+    log_stream.seek(0)
     with st.spinner(f"正在抓取 {label} …"):
         try:
             with db.get_conn() as conn:
@@ -99,6 +108,10 @@ def _run_scraper(key: str) -> None:
             st.success(f"✅ {label} 完成")
         except Exception as exc:
             st.error(f"❌ {label} 失敗：{exc}")
+    logs = log_stream.getvalue()
+    if logs:
+        with st.expander("📋 執行記錄", expanded=("error" in logs.lower() or "failed" in logs.lower())):
+            st.code(logs, language="")
     st.cache_data.clear()
 
 
@@ -125,6 +138,15 @@ with st.sidebar:
         for s in statuses:
             icon = "✅" if s["last_fetched"] else "⚪"
             st.caption(f"{icon} **{s['name']}**  \n{s['last_fetched'] or '未下載'} · {s['n']:,} 筆")
+        # Show Taiwan GDP PPP status specifically
+        with db.get_conn() as _c:
+            tw_row = _c.execute(
+                "SELECT gdp_ppp_usd, year FROM gdp_ppp WHERE country_code='TWN' ORDER BY year DESC LIMIT 1"
+            ).fetchone()
+        if tw_row:
+            st.caption(f"✅ **台灣 GDP PPP**  \n{tw_row['year']} · ${tw_row['gdp_ppp_usd']:,.0f}")
+        else:
+            st.caption("⚪ **台灣 GDP PPP** 未取得")
     else:
         st.info("尚無資料，請先點擊「抓取全部」。")
 
