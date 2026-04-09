@@ -119,15 +119,6 @@ def _run_scraper(key: str) -> None:
     st.cache_data.clear()
 
 
-def _style_diff(val):
-    if pd.isna(val):
-        return ""
-    if val < -15:
-        return "background-color:#d4edda; color:#155724"   # green  – NHI cheaper
-    if val > 15:
-        return "background-color:#f8d7da; color:#721c24"   # red    – NHI expensive
-    return "background-color:#fff3cd; color:#856404"        # yellow – near parity
-
 
 # ── sidebar ────────────────────────────────────────────────────────────────────
 
@@ -221,26 +212,24 @@ with tab_ppp:
             "3. 🏥 WHO/HAI 或 🇯🇵 日本厚生勞動省 — 外國參考價"
         )
     else:
-        show_cols = ["藥品名", "來源國", "原價_USD", "TW_ref_USD",
+        show_cols = ["藥品名", "比對方式", "來源國", "原價_USD", "TW_ref_USD",
                      "TW_ref_TWD", "健保價_TWD", "差異_%"]
         show_cols = [c for c in show_cols if c in df_ppp.columns]
+        display_df = df_ppp[show_cols].copy()
 
-        fmt = {
-            "原價_USD":    "{:.4f}",
-            "TW_ref_USD":  "{:.4f}",
-            "TW_ref_TWD":  "{:.2f}",
-            "健保價_TWD":  "{:.2f}",
-        }
-        fmt_diff = lambda x: f"{x:+.1f}%" if pd.notna(x) else "—"
+        # Format numeric columns as strings for clean display
+        for col, fmt in [("原價_USD", "{:.4f}"), ("TW_ref_USD", "{:.4f}"),
+                         ("TW_ref_TWD", "{:.2f}"), ("健保價_TWD", "{:.2f}")]:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].apply(
+                    lambda x: fmt.format(x) if pd.notna(x) else "—"
+                )
+        if "差異_%" in display_df.columns:
+            display_df["差異_%"] = display_df["差異_%"].apply(
+                lambda x: f"{x:+.1f}%" if pd.notna(x) else "—"
+            )
 
-        styled = (
-            df_ppp[show_cols]
-            .style
-            .map(_style_diff, subset=["差異_%"])
-            .format(fmt, na_rep="—")
-            .format(fmt_diff, subset=["差異_%"])
-        )
-        st.dataframe(styled, use_container_width=True, height=520)
+        st.dataframe(display_df, use_container_width=True, height=520)
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("比較筆數", f"{len(df_ppp):,}")

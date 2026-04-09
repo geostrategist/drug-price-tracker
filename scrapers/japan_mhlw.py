@@ -112,10 +112,16 @@ def _parse_excel(data: bytes, source_id: int) -> pd.DataFrame:
         col_map = {
             "品名": "name_ja",
             "一般名": "generic_name",
+            "成分名": "generic_name",   # INN/component name (main price files)
+            "成分":   "generic_name",   # variant spelling
+            "成分１": "generic_name",   # another variant
             "規格・単位": "strength",
+            "規格単位":   "strength",
+            "規格":        "strength",
             "薬価（円）": "price",
             "薬価": "price",
             "製造販売業者": "manufacturer",
+            "メーカー名":   "manufacturer",
             "薬効分類番号": "atc_code",
         }
         df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
