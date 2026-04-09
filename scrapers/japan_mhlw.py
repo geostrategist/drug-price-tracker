@@ -34,6 +34,24 @@ HEADERS = {
     "Accept-Language": "ja,en;q=0.9",
 }
 
+JPY_USD_FALLBACK = 150.0   # 1 USD ≈ 150 JPY (update if rate drifts significantly)
+
+
+def _get_jpy_per_usd() -> float:
+    """Fetch live JPY/USD rate; fall back to constant if API is unavailable."""
+    try:
+        resp = requests.get(
+            "https://open.er-api.com/v6/latest/USD",
+            headers={"User-Agent": HEADERS["User-Agent"]},
+            timeout=10,
+        )
+        rate = float(resp.json()["rates"]["JPY"])
+        logger.info("JPY/USD rate: %.2f (live)", rate)
+        return rate
+    except Exception as e:
+        logger.warning("Exchange rate fetch failed (%s); using fallback %.1f", e, JPY_USD_FALLBACK)
+        return JPY_USD_FALLBACK
+
 
 def _download_excel(url: str) -> bytes:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -143,6 +161,7 @@ def fetch(conn: sqlite3.Connection) -> None:
         return
 
     logger.info("Found %d Excel file(s)", len(links))
+    jpy_per_usd = _get_jpy_per_usd()
     total_rows = 0
 
     for url in links:
@@ -176,10 +195,11 @@ def fetch(conn: sqlite3.Connection) -> None:
                 conn,
                 drug_id=drug_id,
                 source_id=source_id,
-                country="JP",
+                country="JPN",
                 price=float(price_val),
                 currency="JPY",
                 unit="per unit",
+                price_usd=float(price_val) / jpy_per_usd,
                 effective_date="2025-04-01",
             )
             total_rows += 1

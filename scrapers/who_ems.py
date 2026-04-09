@@ -27,7 +27,10 @@ from db import upsert_source, mark_fetched, insert_drug, insert_price
 logger = logging.getLogger(__name__)
 
 HAI_URL = "https://www.who.int/medicines/areas/access/OMS_Medicine_prices.xls"
-EML_API  = "https://list.essentialmedicines.org/api/v1/medicines"
+# Fallback 1: WHO Global Price Reporting Mechanism open dataset (CSV)
+WHO_GPRM_URL = "https://www.who.int/docs/default-source/medicines/global-price-reporting/gprm-2022-public.xlsx"
+# Fallback 2: WHO EML JSON API
+EML_API = "https://list.essentialmedicines.org/api/v1/medicines"
 CACHE_DIR = Path(__file__).parent.parent / "data" / "who"
 
 HEADERS = {
@@ -126,6 +129,69 @@ def _fetch_hai(source_id: int, conn: sqlite3.Connection) -> int:
     return saved
 
 
+def _fetch_gprm(source_id: int, conn: sqlite3.Connection) -> int:
+    """Try WHO Global Price Reporting Mechanism public dataset."""
+    cache = _cache_path("gprm_2022_public.xlsx")
+    if cache.exists():
+        data = cache.read_bytes()
+    else:
+        logger.info("  downloading WHO GPRM dataset …")
+        try:
+            resp = requests.get(WHO_GPRM_URL, headers=HEADERS, timeout=60)
+            resp.raise_for_status()
+            data = resp.content
+            cache.write_bytes(data)
+        except requests.RequestException as e:
+            logger.error("  GPRM download failed: %s", e)
+            return 0
+
+    try:
+        df = pd.read_excel(BytesIO(data), engine="openpyxl", header=0)
+    except Exception as e:
+        logger.error("  GPRM parse failed: %s", e)
+        return 0
+
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    col_aliases = {
+        "medicine_name": "name_en", "product_name": "name_en",
+        "inn": "generic_name", "generic_name": "generic_name",
+        "country": "country", "buyer_country": "country",
+        "unit_price_usd": "price_usd", "price_usd": "price_usd",
+        "pack_price_usd": "price_usd",
+        "dosage_form": "dosage_form", "strength": "strength",
+        "year": "year",
+    }
+    df = df.rename(columns={k: v for k, v in col_aliases.items() if k in df.columns})
+
+    if "name_en" not in df.columns:
+        return 0
+
+    saved = 0
+    for _, row in df.iterrows():
+        name = str(row.get("name_en") or "").strip()
+        if not name or name.lower() == "nan":
+            continue
+        price_usd = pd.to_numeric(row.get("price_usd"), errors="coerce")
+        country = str(row.get("country") or "").strip() or "UNKNOWN"
+        drug_id = insert_drug(
+            conn, name_en=name,
+            generic_name=str(row.get("generic_name") or "").strip() or None,
+            dosage_form=str(row.get("dosage_form") or "").strip() or None,
+            strength=str(row.get("strength") or "").strip() or None,
+            source_id=source_id,
+        )
+        insert_price(
+            conn, drug_id=drug_id, source_id=source_id,
+            country=country,
+            price=float(price_usd) if pd.notna(price_usd) else None,
+            currency="USD",
+            price_usd=float(price_usd) if pd.notna(price_usd) else None,
+            effective_date=str(row.get("year") or "").strip() or None,
+        )
+        saved += 1
+    return saved
+
+
 def _fetch_eml(source_id: int, conn: sqlite3.Connection) -> int:
     """Fallback: pull drug names from the WHO EML JSON API (no pricing)."""
     logger.info("  falling back to WHO EML API (names only, no pricing) …")
@@ -165,7 +231,10 @@ def fetch(conn: sqlite3.Connection) -> None:
 
     saved = _fetch_hai(source_id, conn)
     if saved == 0:
-        logger.warning("HAI dataset unavailable; trying WHO EML fallback …")
+        logger.warning("HAI dataset unavailable; trying WHO GPRM …")
+        saved = _fetch_gprm(source_id, conn)
+    if saved == 0:
+        logger.warning("GPRM unavailable; trying WHO EML fallback …")
         saved = _fetch_eml(source_id, conn)
 
     mark_fetched(conn, source_id)
