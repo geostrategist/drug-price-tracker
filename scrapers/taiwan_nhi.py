@@ -4,11 +4,13 @@ Taiwan National Health Insurance (全民健保) drug reimbursement price scraper
 Source: 衛生福利部中央健康保險署 – 藥品給付項目及支付標準
 Prices are in TWD (New Taiwan Dollar).
 
-Tries multiple known URLs in order until one succeeds.
+The NHIA API returns JSON metadata with a download URL; we extract it and
+fetch the actual CSV. Multiple fallback URLs are tried in sequence.
 """
 from __future__ import annotations
 
 import io
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -20,26 +22,34 @@ from db import upsert_source, mark_fetched, insert_drug, insert_price
 
 logger = logging.getLogger(__name__)
 
-# Try these URLs in order — NHIA occasionally changes the endpoint
-NHI_URLS = [
-    "https://info.nhi.gov.tw/api/iode0000s01/Dataset?rId=A21030000I-E41001-001",
-    "https://data.nhi.gov.tw/api/iode0000s01/Dataset?rId=A21030000I-E41001-001",
+# Endpoint that returns JSON metadata (contains a CSV download URL)
+NHI_META_URL = (
+    "https://data.gov.tw/api/v2/rest/dataset/23715"
+)
+# Direct download attempts (try each in order)
+NHI_DIRECT_URLS = [
+    # data.nhi.gov.tw direct download
     "https://data.nhi.gov.tw/Datasets/Download.ashx?rid=A21030000I-E41001-001&l=0",
+    # info.nhi.gov.tw API
+    "https://info.nhi.gov.tw/api/iode0000s01/Dataset?rId=A21030000I-E41001-001",
+    # data.gov.tw direct
+    "https://data.gov.tw/api/v2/rest/dataset/23715",
 ]
 CACHE_DIR = Path(__file__).parent.parent / "data" / "taiwan_nhi"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (DrugPriceTracker/1.0; research)",
-    "Accept": "text/csv,application/octet-stream,*/*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/csv,application/octet-stream,application/json,*/*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 
 COL_ALIASES = {
     "中文品名": "name_zh", "中文藥品名稱": "name_zh", "藥品中文名稱": "name_zh",
     "英文品名": "name_en", "英文藥品名稱": "name_en", "藥品英文名稱": "name_en",
     "藥品名稱": "name_en",
-    "一般名稱": "generic_name", "成分名": "generic_name",
+    "一般名稱": "generic_name", "成分名": "generic_name", "學名": "generic_name",
     "atc碼": "atc_code", "atc_code": "atc_code", "atc": "atc_code",
     "健保支付價格": "price_twd", "支付價格": "price_twd",
-    "健保價": "price_twd", "藥價": "price_twd",
+    "健保價": "price_twd", "藥價": "price_twd", "price": "price_twd",
     "劑型": "dosage_form", "藥品劑型": "dosage_form",
     "規格": "strength", "藥品規格": "strength",
     "製造廠": "manufacturer", "藥商名稱": "manufacturer", "廠商名稱": "manufacturer",
@@ -51,47 +61,100 @@ def _cache_path(fname: str) -> Path:
     return CACHE_DIR / fname
 
 
-def _download_csv() -> tuple[bytes, str]:
-    """Try each URL and return (content, url_used). Raises if all fail."""
-    cache = _cache_path("nhi_drug_prices.csv")
-    if cache.exists():
-        logger.info("  cache hit: nhi_drug_prices.csv")
-        return cache.read_bytes(), NHI_URLS[0]
+def _is_csv_content(data: bytes) -> bool:
+    """Return True if data looks like CSV, not HTML."""
+    try:
+        preview = data[:1000].decode("utf-8-sig", errors="ignore")
+    except Exception:
+        preview = data[:1000].decode("latin-1", errors="ignore")
+    if "<html" in preview.lower() or "<!doctype" in preview.lower():
+        return False
+    # Should have commas or tabs and not start with { (JSON)
+    if preview.strip().startswith("{") or preview.strip().startswith("["):
+        return False
+    return True
 
-    last_err = None
-    for url in NHI_URLS:
+
+def _try_extract_download_url(data: bytes) -> str | None:
+    """If response is JSON metadata, try to extract the actual CSV download URL."""
+    try:
+        text = data.decode("utf-8-sig", errors="ignore")
+        obj = json.loads(text)
+        # data.gov.tw format: {"result": {"distribution": [{"accessURL": "..."}]}}
+        for dist in (obj.get("result") or {}).get("distribution") or []:
+            url = dist.get("accessURL") or dist.get("downloadURL") or ""
+            if url and (".csv" in url.lower() or "download" in url.lower()):
+                return url
+        # NHIA API format: {"results": [{"download_url": "..."}]}
+        for item in (obj.get("result") or {}).get("records") or []:
+            url = item.get("download_url") or item.get("url") or ""
+            if url:
+                return url
+    except Exception:
+        pass
+    return None
+
+
+def _download(force_fresh: bool = False) -> bytes:
+    """Download NHI drug price CSV. Returns raw bytes."""
+    cache = _cache_path("nhi_drug_prices.csv")
+    if cache.exists() and not force_fresh:
+        logger.info("  cache hit: nhi_drug_prices.csv (%d bytes)", cache.stat().st_size)
+        return cache.read_bytes()
+
+    last_err: Exception | None = None
+
+    for url in NHI_DIRECT_URLS:
         try:
             logger.info("  trying: %s", url)
             resp = requests.get(url, headers=HEADERS, timeout=60, allow_redirects=True)
             resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "")
-            # Make sure we got actual data, not an HTML error page
-            if "html" in content_type.lower() and not resp.content.startswith(b"\xef\xbb\xbf"):
-                # Check if it looks like CSV anyway (has commas / tabs)
-                preview = resp.content[:500].decode("utf-8", errors="ignore")
-                if "<html" in preview.lower():
-                    logger.warning("  got HTML instead of CSV, skipping: %s", url)
-                    continue
-            cache.write_bytes(resp.content)
-            logger.info("  downloaded %d bytes from %s", len(resp.content), url)
-            return resp.content, url
+            data = resp.content
+            logger.info("  got %d bytes, content-type: %s", len(data), resp.headers.get("content-type", "?"))
+
+            # Case 1: got CSV directly
+            if _is_csv_content(data):
+                cache.write_bytes(data)
+                logger.info("  ✓ downloaded CSV directly")
+                return data
+
+            # Case 2: got JSON metadata with a download URL
+            dl_url = _try_extract_download_url(data)
+            if dl_url:
+                logger.info("  found download URL in JSON: %s", dl_url)
+                resp2 = requests.get(dl_url, headers=HEADERS, timeout=60, allow_redirects=True)
+                resp2.raise_for_status()
+                data2 = resp2.content
+                if _is_csv_content(data2):
+                    cache.write_bytes(data2)
+                    logger.info("  ✓ downloaded CSV via metadata URL")
+                    return data2
+                logger.warning("  metadata URL also didn't return CSV")
+            else:
+                logger.warning("  not CSV and no download URL found; preview: %s",
+                               data[:200].decode("utf-8", errors="replace"))
+
         except Exception as e:
-            logger.warning("  failed (%s): %s", url, e)
+            logger.warning("  failed: %s — %s", url, e)
             last_err = e
 
-    raise RuntimeError(f"All Taiwan NHI URLs failed. Last error: {last_err}")
+    raise RuntimeError(f"All NHI URLs failed. Last: {last_err}")
 
 
 def _read_csv(data: bytes) -> pd.DataFrame:
     for enc in ("utf-8-sig", "utf-8", "cp950", "big5", "latin-1"):
-        try:
-            df = pd.read_csv(io.BytesIO(data), encoding=enc, low_memory=False, on_bad_lines="skip")
-            if len(df.columns) >= 3:
-                logger.info("  parsed OK with %s, shape: %s", enc, df.shape)
-                return df
-        except Exception:
-            continue
-    raise ValueError("Cannot parse Taiwan NHI CSV with any known encoding")
+        for sep in (",", "\t", "|"):
+            try:
+                df = pd.read_csv(
+                    io.BytesIO(data), encoding=enc, sep=sep,
+                    low_memory=False, on_bad_lines="skip",
+                )
+                if len(df.columns) >= 3 and len(df) > 0:
+                    logger.info("  parsed: enc=%s sep=%r shape=%s", enc, sep, df.shape)
+                    return df
+            except Exception:
+                continue
+    raise ValueError("Cannot parse NHI CSV")
 
 
 def fetch(conn: sqlite3.Connection) -> None:
@@ -99,44 +162,45 @@ def fetch(conn: sqlite3.Connection) -> None:
     source_id = upsert_source(
         conn,
         name="Taiwan NHI 藥品給付支付標準",
-        url=NHI_URLS[0],
+        url=NHI_DIRECT_URLS[0],
         description="全民健保藥品給付項目及支付標準（中央健康保險署）",
     )
 
-    # Always call mark_fetched at end even on partial failure
     saved = 0
     try:
-        data, used_url = _download_csv()
+        data = _download()
     except Exception as e:
-        logger.error("Taiwan NHI download failed: %s", e)
+        logger.error("NHI download failed: %s", e)
         mark_fetched(conn, source_id)
         return
 
     try:
         df = _read_csv(data)
     except Exception as e:
-        logger.error("Taiwan NHI parse failed: %s", e)
+        logger.error("NHI parse failed: %s", e)
         mark_fetched(conn, source_id)
         return
 
     # Normalise column names
-    df.columns = [str(c).strip().lower().replace(" ", "").replace("　", "") for c in df.columns]
+    norm = lambda s: str(s).strip().lower().replace(" ", "").replace("　", "")
+    df.columns = [norm(c) for c in df.columns]
+    logger.info("  Raw columns: %s", list(df.columns)[:20])
+
     rename_map = {}
     for col in df.columns:
         for alias, field in COL_ALIASES.items():
-            if col == alias.lower().replace(" ", "").replace("　", ""):
+            if col == norm(alias):
                 rename_map[col] = field
                 break
     df = df.rename(columns=rename_map)
+    logger.info("  Renamed columns: %s", list(df.columns)[:20])
 
-    logger.info("  Columns: %s", list(df.columns)[:15])
-
-    has_name = "name_zh" in df.columns or "name_en" in df.columns
+    has_name  = "name_zh" in df.columns or "name_en" in df.columns
     has_price = "price_twd" in df.columns
 
     if not has_name or not has_price:
         logger.error(
-            "NHI CSV missing required columns. Has name=%s, has price=%s. All cols: %s",
+            "NHI: missing required columns. has_name=%s has_price=%s  cols=%s",
             has_name, has_price, list(df.columns),
         )
         mark_fetched(conn, source_id)
@@ -147,7 +211,6 @@ def fetch(conn: sqlite3.Connection) -> None:
         name_en = str(row.get("name_en") or "").strip() or None
         if not name_zh and not name_en:
             continue
-
         price_twd = pd.to_numeric(row.get("price_twd"), errors="coerce")
         if pd.isna(price_twd) or price_twd <= 0:
             continue
@@ -171,7 +234,6 @@ def fetch(conn: sqlite3.Connection) -> None:
             price=float(price_twd),
             currency="TWD",
             unit="per unit",
-            effective_date=None,
         )
         saved += 1
 

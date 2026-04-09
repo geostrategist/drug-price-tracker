@@ -55,9 +55,13 @@ SCRAPERS = {
 def _source_status() -> list:
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT name, last_fetched, "
-            "(SELECT COUNT(*) FROM prices WHERE source_id=sources.id) AS n "
-            "FROM sources ORDER BY name"
+            """SELECT name, last_fetched,
+               (SELECT COUNT(*) FROM prices   WHERE source_id=sources.id) AS n_prices,
+               CASE WHEN name LIKE '%World Bank%'
+                    THEN (SELECT COUNT(*) FROM gdp_ppp)
+                    ELSE (SELECT COUNT(*) FROM prices WHERE source_id=sources.id)
+               END AS n
+               FROM sources ORDER BY name"""
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -182,7 +186,7 @@ with st.sidebar:
 # ── main ───────────────────────────────────────────────────────────────────────
 
 st.title("💊 跨國藥價 PPP 校正比較")
-tab_ppp, tab_search, tab_chart = st.tabs(["📊 PPP 比較表", "🔍 藥品搜尋", "📈 總覽圖表"])
+tab_ppp, tab_search, tab_chart, tab_debug = st.tabs(["📊 PPP 比較表", "🔍 藥品搜尋", "📈 總覽圖表", "🔧 診斷"])
 
 
 # ═══ Tab 1: PPP 比較表 ═════════════════════════════════════════════════════════
@@ -337,3 +341,58 @@ with tab_chart:
                     log_y=True, opacity=0.7,
                 )
                 st.plotly_chart(fig3, use_container_width=True)
+
+
+# ═══ Tab 4: 診斷 ════════════════════════════════════════════════════════════════
+
+with tab_debug:
+    st.subheader("資料庫狀態")
+    with db.get_conn() as _conn:
+        # Table row counts
+        tables = ["sources", "drugs", "prices", "gdp_ppp"]
+        cols = st.columns(len(tables))
+        for i, t in enumerate(tables):
+            n = _conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            cols[i].metric(t, f"{n:,}")
+
+        # Taiwan GDP PPP
+        st.markdown("**台灣 GDP PPP (gdp_ppp 表)**")
+        tw_rows = _conn.execute(
+            "SELECT country_code, country_name, year, gdp_ppp_usd FROM gdp_ppp "
+            "WHERE country_code='TWN' ORDER BY year DESC LIMIT 5"
+        ).fetchall()
+        if tw_rows:
+            st.dataframe(pd.DataFrame([dict(r) for r in tw_rows]), use_container_width=True)
+        else:
+            st.error("❌ gdp_ppp 表中沒有台灣資料 (TWN)。請重新抓取 World Bank 資料。")
+
+        # Japan sample
+        st.markdown("**日本藥價樣本（前 10 筆有 price_usd 的）**")
+        jp_rows = _conn.execute(
+            "SELECT d.name_ja, p.price, p.currency, p.price_usd, p.country "
+            "FROM prices p JOIN drugs d ON d.id=p.drug_id "
+            "WHERE p.country='JPN' AND p.price_usd IS NOT NULL LIMIT 10"
+        ).fetchall()
+        if jp_rows:
+            st.dataframe(pd.DataFrame([dict(r) for r in jp_rows]), use_container_width=True)
+        else:
+            st.warning("找不到日本藥價的 price_usd 欄位資料。")
+
+        # Taiwan NHI sample
+        st.markdown("**台灣健保藥價樣本（前 10 筆）**")
+        nhi_rows = _conn.execute(
+            "SELECT d.name_ja, d.name_en, p.price, p.currency "
+            "FROM prices p JOIN drugs d ON d.id=p.drug_id "
+            "WHERE p.country='TWN' LIMIT 10"
+        ).fetchall()
+        if nhi_rows:
+            st.dataframe(pd.DataFrame([dict(r) for r in nhi_rows]), use_container_width=True)
+        else:
+            st.warning("找不到台灣健保藥價資料（country='TWN'）。")
+
+    st.markdown("**執行記錄**")
+    logs = log_stream.getvalue()
+    if logs:
+        st.code(logs[-3000:], language="")
+    else:
+        st.caption("尚無記錄，請先執行抓取。")
