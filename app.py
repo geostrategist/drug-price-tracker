@@ -236,7 +236,7 @@ with tab_ppp:
         styled = (
             df_ppp[show_cols]
             .style
-            .applymap(_style_diff, subset=["差異_%"])
+            .map(_style_diff, subset=["差異_%"])
             .format(fmt, na_rep="—")
             .format(fmt_diff, subset=["差異_%"])
         )
