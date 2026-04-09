@@ -235,10 +235,5 @@ def build_comparison_table(
         return df
 
     # Sort by drug name then descending absolute diff
-    df = df.sort_values(
-        by=["藥品名", "差異_%"],
-        key=lambda col: col.abs() if col.name == "差異_%" else col,
-        ascending=[True, False],
-        na_position="last",
-    )
+    df = df.sort_values(by=["藥品名"], ascending=True, na_position="last")
     return df.reset_index(drop=True)
