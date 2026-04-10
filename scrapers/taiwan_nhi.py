@@ -27,14 +27,15 @@ from db import upsert_source, mark_fetched, insert_drug, insert_price
 logger = logging.getLogger(__name__)
 
 # Ordered list of download attempts.
-# data.gov.tw returns JSON metadata; we parse it to find the CSV URL.
-# info.nhi.gov.tw requires verify=False (Missing Subject Key Identifier cert).
+# Taiwan NHI servers block non-Taiwan IPs → GitHub Releases mirror is tried first.
 NHI_DIRECT_URLS = [
+    # GitHub Releases mirror (accessible everywhere, updated periodically)
+    "https://github.com/geostrategist/drug-price-tracker/releases/download/nhi-data-2026/nhi_drug_prices.csv",
     # data.gov.tw metadata → extract CSV URL from distribution/resources field
     "https://data.gov.tw/api/v2/rest/dataset/23715",
     # info.nhi.gov.tw – SSL cert issue, use verify=False
     "https://info.nhi.gov.tw/api/iode0000s01/Dataset?rId=A21030000I-E41001-001",
-    # data.nhi.gov.tw – may be DNS-blocked outside Taiwan
+    # data.nhi.gov.tw – DNS-blocked outside Taiwan
     "https://data.nhi.gov.tw/Datasets/Download.ashx?rid=A21030000I-E41001-001&l=0",
 ]
 CACHE_DIR = Path(__file__).parent.parent / "data" / "taiwan_nhi"
@@ -165,8 +166,9 @@ def _download(force_fresh: bool = False) -> Path:
             resp.raise_for_status()
             ct = resp.headers.get("content-type", "")
 
-            # Case 1: response is CSV → stream directly to file
-            if "csv" in ct.lower() or "octet" in ct.lower():
+            # Case 1: response is CSV or binary download → stream directly to file
+            if ("csv" in ct.lower() or "octet" in ct.lower()
+                    or "github" in url or url.endswith(".csv")):
                 total = _stream_to_file(resp, cache)
                 logger.info("  CSV saved: %.1f MB", total / 1024 / 1024)
                 return cache
