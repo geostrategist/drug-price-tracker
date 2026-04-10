@@ -13,27 +13,29 @@ import io
 import json
 import logging
 import sqlite3
+import urllib3
 from pathlib import Path
 
 import requests
 import pandas as pd
 
+# Suppress SSL warnings from gov.tw servers that have certificate issues
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 from db import upsert_source, mark_fetched, insert_drug, insert_price
 
 logger = logging.getLogger(__name__)
 
-# Endpoint that returns JSON metadata (contains a CSV download URL)
-NHI_META_URL = (
-    "https://data.gov.tw/api/v2/rest/dataset/23715"
-)
-# Direct download attempts (try each in order)
+# Ordered list of download attempts.
+# data.gov.tw returns JSON metadata; we parse it to find the CSV URL.
+# info.nhi.gov.tw requires verify=False (Missing Subject Key Identifier cert).
 NHI_DIRECT_URLS = [
-    # info.nhi.gov.tw – confirmed working (UTF-8 BOM, ~95 MB)
-    "https://info.nhi.gov.tw/api/iode0000s01/Dataset?rId=A21030000I-E41001-001",
-    # data.nhi.gov.tw direct download (may be unavailable outside Taiwan)
-    "https://data.nhi.gov.tw/Datasets/Download.ashx?rid=A21030000I-E41001-001&l=0",
-    # data.gov.tw direct
+    # data.gov.tw metadata → extract CSV URL from distribution/resources field
     "https://data.gov.tw/api/v2/rest/dataset/23715",
+    # info.nhi.gov.tw – SSL cert issue, use verify=False
+    "https://info.nhi.gov.tw/api/iode0000s01/Dataset?rId=A21030000I-E41001-001",
+    # data.nhi.gov.tw – may be DNS-blocked outside Taiwan
+    "https://data.nhi.gov.tw/Datasets/Download.ashx?rid=A21030000I-E41001-001&l=0",
 ]
 CACHE_DIR = Path(__file__).parent.parent / "data" / "taiwan_nhi"
 HEADERS = {
@@ -92,16 +94,40 @@ def _try_extract_download_url(data: bytes) -> str | None:
     try:
         text = data.decode("utf-8-sig", errors="ignore")
         obj = json.loads(text)
-        # data.gov.tw format: {"result": {"distribution": [{"accessURL": "..."}]}}
-        for dist in (obj.get("result") or {}).get("distribution") or []:
-            url = dist.get("accessURL") or dist.get("downloadURL") or ""
-            if url and (".csv" in url.lower() or "download" in url.lower()):
+        result = obj.get("result") or {}
+
+        # data.gov.tw v2 format: result.distribution[].resourceDownloadUrl (or accessURL etc.)
+        for dist in result.get("distribution") or []:
+            for key in ("resourceDownloadUrl", "accessURL", "downloadURL", "url"):
+                url = dist.get(key) or ""
+                if url and url.startswith("http"):
+                    return url
+
+        # CKAN-style: result.resources[].url
+        for res in result.get("resources") or []:
+            url = res.get("url") or res.get("download_url") or ""
+            if url:
                 return url
-        # NHIA API format: {"results": [{"download_url": "..."}]}
-        for item in (obj.get("result") or {}).get("records") or []:
+
+        # data.gov.tw may embed resources as top-level list
+        for item in result.get("records") or []:
             url = item.get("download_url") or item.get("url") or ""
             if url:
                 return url
+
+        # Last resort: scan every string value in the JSON tree for a CSV/download URL
+        text_lower = text.lower()
+        for candidate in ("data.nhi.gov.tw", "info.nhi.gov.tw", ".csv"):
+            idx = text_lower.find(candidate)
+            if idx != -1:
+                # extract the URL by walking back to the nearest quote
+                start = text.rfind('"', 0, idx) + 1
+                end = text.find('"', idx)
+                if start and end > start:
+                    url = text[start:end]
+                    if url.startswith("http"):
+                        logger.info("  extracted URL via string scan: %s", url)
+                        return url
     except Exception:
         pass
     return None
@@ -119,9 +145,9 @@ def _download(force_fresh: bool = False) -> bytes:
     for url in NHI_DIRECT_URLS:
         try:
             logger.info("  trying: %s", url)
-            # Stream download to handle large file (~95 MB)
+            # verify=False needed for gov.tw certs with Missing Subject Key Identifier
             resp = requests.get(url, headers=HEADERS, timeout=120,
-                                allow_redirects=True, stream=True)
+                                allow_redirects=True, stream=True, verify=False)
             resp.raise_for_status()
 
             chunks = []
@@ -141,20 +167,30 @@ def _download(force_fresh: bool = False) -> bytes:
                 logger.info("  CSV downloaded OK")
                 return data
 
-            # Case 2: got JSON metadata with a download URL
+            # Case 2: got JSON metadata → extract the actual CSV URL
             dl_url = _try_extract_download_url(data)
             if dl_url:
                 logger.info("  following metadata URL: %s", dl_url)
                 resp2 = requests.get(dl_url, headers=HEADERS, timeout=120,
-                                     allow_redirects=True, stream=True)
+                                     allow_redirects=True, stream=True, verify=False)
                 resp2.raise_for_status()
-                data2 = b"".join(resp2.iter_content(512 * 1024))
+                chunks2 = []
+                total2 = 0
+                for chunk in resp2.iter_content(512 * 1024):
+                    chunks2.append(chunk)
+                    total2 += len(chunk)
+                    if total2 % (10 * 1024 * 1024) < 512 * 1024:
+                        logger.info("  downloaded %.0f MB …", total2 / 1024 / 1024)
+                data2 = b"".join(chunks2)
+                logger.info("  metadata→CSV: %.1f MB", total2 / 1024 / 1024)
                 if _is_csv_content(data2):
                     cache.write_bytes(data2)
                     return data2
+                logger.warning("  metadata URL did not yield CSV, preview: %s",
+                               data2[:200].decode("utf-8", errors="replace"))
             else:
-                logger.warning("  not CSV, preview: %s",
-                               data[:300].decode("utf-8", errors="replace"))
+                logger.warning("  not CSV and no download URL found, preview: %s",
+                               data[:400].decode("utf-8", errors="replace"))
 
         except Exception as e:
             logger.warning("  failed (%s): %s", url, e)
