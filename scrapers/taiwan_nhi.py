@@ -133,64 +133,59 @@ def _try_extract_download_url(data: bytes) -> str | None:
     return None
 
 
-def _download(force_fresh: bool = False) -> bytes:
-    """Download NHI drug price CSV. Returns raw bytes."""
+def _stream_to_file(resp: requests.Response, dest: Path) -> int:
+    """Stream an HTTP response directly to *dest*. Returns total bytes written."""
+    total = 0
+    tmp = dest.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):  # 1 MB chunks
+            f.write(chunk)
+            total += len(chunk)
+            if total % (10 * 1024 * 1024) < 1024 * 1024:
+                logger.info("  downloaded %.0f MB …", total / 1024 / 1024)
+    tmp.replace(dest)
+    return total
+
+
+def _download(force_fresh: bool = False) -> Path:
+    """Download NHI drug price CSV to cache and return the cache Path."""
     cache = _cache_path("nhi_drug_prices.csv")
     if cache.exists() and not force_fresh:
-        logger.info("  cache hit: nhi_drug_prices.csv (%d bytes)", cache.stat().st_size)
-        return cache.read_bytes()
+        logger.info("  cache hit: nhi_drug_prices.csv (%.1f MB)",
+                    cache.stat().st_size / 1024 / 1024)
+        return cache
 
     last_err: Exception | None = None
 
     for url in NHI_DIRECT_URLS:
         try:
             logger.info("  trying: %s", url)
-            # verify=False needed for gov.tw certs with Missing Subject Key Identifier
             resp = requests.get(url, headers=HEADERS, timeout=120,
                                 allow_redirects=True, stream=True, verify=False)
             resp.raise_for_status()
+            ct = resp.headers.get("content-type", "")
 
-            chunks = []
-            total = 0
-            for chunk in resp.iter_content(chunk_size=512 * 1024):
-                chunks.append(chunk)
-                total += len(chunk)
-                if total % (10 * 1024 * 1024) < 512 * 1024:
-                    logger.info("  downloaded %.0f MB …", total / 1024 / 1024)
-            data = b"".join(chunks)
-            logger.info("  total %.1f MB, content-type: %s",
-                        len(data) / 1024 / 1024, resp.headers.get("content-type", "?"))
+            # Case 1: response is CSV → stream directly to file
+            if "csv" in ct.lower() or "octet" in ct.lower():
+                total = _stream_to_file(resp, cache)
+                logger.info("  CSV saved: %.1f MB", total / 1024 / 1024)
+                return cache
 
-            # Case 1: got CSV directly
-            if _is_csv_content(data):
-                cache.write_bytes(data)
-                logger.info("  CSV downloaded OK")
-                return data
-
-            # Case 2: got JSON metadata → extract the actual CSV URL
-            dl_url = _try_extract_download_url(data)
+            # Case 2: response is JSON metadata → extract download URL
+            meta_bytes = resp.content  # small JSON, OK to buffer
+            logger.info("  got JSON metadata (%.1f KB)", len(meta_bytes) / 1024)
+            dl_url = _try_extract_download_url(meta_bytes)
             if dl_url:
                 logger.info("  following metadata URL: %s", dl_url)
                 resp2 = requests.get(dl_url, headers=HEADERS, timeout=120,
                                      allow_redirects=True, stream=True, verify=False)
                 resp2.raise_for_status()
-                chunks2 = []
-                total2 = 0
-                for chunk in resp2.iter_content(512 * 1024):
-                    chunks2.append(chunk)
-                    total2 += len(chunk)
-                    if total2 % (10 * 1024 * 1024) < 512 * 1024:
-                        logger.info("  downloaded %.0f MB …", total2 / 1024 / 1024)
-                data2 = b"".join(chunks2)
-                logger.info("  metadata→CSV: %.1f MB", total2 / 1024 / 1024)
-                if _is_csv_content(data2):
-                    cache.write_bytes(data2)
-                    return data2
-                logger.warning("  metadata URL did not yield CSV, preview: %s",
-                               data2[:200].decode("utf-8", errors="replace"))
-            else:
-                logger.warning("  not CSV and no download URL found, preview: %s",
-                               data[:400].decode("utf-8", errors="replace"))
+                total2 = _stream_to_file(resp2, cache)
+                logger.info("  metadata→CSV saved: %.1f MB", total2 / 1024 / 1024)
+                return cache
+
+            logger.warning("  not CSV and no download URL found, preview: %s",
+                           meta_bytes[:400].decode("utf-8", errors="replace"))
 
         except Exception as e:
             logger.warning("  failed (%s): %s", url, e)
@@ -199,13 +194,16 @@ def _download(force_fresh: bool = False) -> bytes:
     raise RuntimeError(f"All NHI URLs failed. Last: {last_err}")
 
 
-def _detect_encoding_sep(data: bytes) -> tuple:
+def _detect_encoding_sep(csv_path: Path) -> tuple:
     """Return (encoding, separator) that successfully parses the first 3 rows."""
+    # Read only first 64 KB to probe the file — avoids loading the whole 95 MB
+    with open(csv_path, "rb") as f:
+        probe = f.read(65536)
     for enc in ("utf-8-sig", "utf-8", "cp950", "big5", "latin-1"):
         for sep in (",", "\t", "|"):
             try:
                 df = pd.read_csv(
-                    io.BytesIO(data[:65536]), encoding=enc, sep=sep,
+                    io.BytesIO(probe), encoding=enc, sep=sep,
                     low_memory=False, on_bad_lines="skip", nrows=3,
                 )
                 if len(df.columns) >= 3 and len(df) > 0:
@@ -306,25 +304,25 @@ def fetch(conn: sqlite3.Connection) -> None:
 
     saved = 0
     try:
-        data = _download()
+        csv_path = _download()
     except Exception as e:
         logger.error("NHI download failed: %s", e)
         mark_fetched(conn, source_id)
         return
 
-    # Detect encoding/separator from first 64KB only
+    # Detect encoding/separator from first 64KB — reads header only, not full file
     try:
-        enc, sep = _detect_encoding_sep(data)
+        enc, sep = _detect_encoding_sep(csv_path)
     except Exception as e:
         logger.error("NHI encoding detection failed: %s", e)
         mark_fetched(conn, source_id)
         return
 
-    # Stream-parse in chunks of 5000 rows to stay within memory limits
+    # Stream-parse directly from disk in chunks of 5000 rows (never loads full file)
     CHUNK = 5000
     try:
         reader = pd.read_csv(
-            io.BytesIO(data), encoding=enc, sep=sep,
+            csv_path, encoding=enc, sep=sep,
             low_memory=False, on_bad_lines="skip",
             chunksize=CHUNK,
         )
