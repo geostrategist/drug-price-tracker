@@ -135,7 +135,7 @@ def _run_scraper(key: str) -> None:
 
 with st.sidebar:
     st.title("💊 藥價追蹤系統")
-    st.caption("PPP 校正跨國藥價比較平台")
+    st.caption("PPP 校正跨國藥價比較平台(成淵高中)")
 
     st.divider()
     st.subheader("資料狀態")
