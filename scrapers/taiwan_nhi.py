@@ -163,20 +163,100 @@ def _download(force_fresh: bool = False) -> bytes:
     raise RuntimeError(f"All NHI URLs failed. Last: {last_err}")
 
 
-def _read_csv(data: bytes) -> pd.DataFrame:
+def _detect_encoding_sep(data: bytes) -> tuple:
+    """Return (encoding, separator) that successfully parses the first 3 rows."""
     for enc in ("utf-8-sig", "utf-8", "cp950", "big5", "latin-1"):
         for sep in (",", "\t", "|"):
             try:
                 df = pd.read_csv(
-                    io.BytesIO(data), encoding=enc, sep=sep,
-                    low_memory=False, on_bad_lines="skip",
+                    io.BytesIO(data[:65536]), encoding=enc, sep=sep,
+                    low_memory=False, on_bad_lines="skip", nrows=3,
                 )
                 if len(df.columns) >= 3 and len(df) > 0:
-                    logger.info("  parsed: enc=%s sep=%r shape=%s", enc, sep, df.shape)
-                    return df
+                    logger.info("  detected: enc=%s sep=%r cols=%d", enc, sep, len(df.columns))
+                    return enc, sep
             except Exception:
                 continue
-    raise ValueError("Cannot parse NHI CSV")
+    raise ValueError("Cannot detect NHI CSV encoding/separator")
+
+
+def _norm_col(s: str) -> str:
+    return str(s).strip().lower().replace(" ", "").replace("\u3000", "")
+
+
+def _apply_rename(cols: list) -> dict:
+    """Build rename map from raw column list."""
+    rename = {}
+    for col in cols:
+        for alias, field in COL_ALIASES.items():
+            if col == _norm_col(alias):
+                rename[col] = field
+                break
+    # Positional fallback if alias match fails
+    # Known stable order: [0]異動 [1]藥品代號 [2]英文名 [3]中文名 [4]成份
+    # [5]規格量 [6]規格單位 [7]單複方 [8]支付價 ... [12]製造廠名稱 [13]劑型 [16]ATC代碼
+    if "name_en" not in rename.values() and len(cols) >= 9:
+        logger.warning("  alias match failed; using positional fallback")
+        for dst, idx in [("name_en", 2), ("name_zh", 3), ("generic_name", 4),
+                         ("price_twd", 8), ("manufacturer", 12),
+                         ("dosage_form", 13), ("atc_code", 16)]:
+            if idx < len(cols):
+                rename[cols[idx]] = dst
+    return rename
+
+
+def _process_chunk(chunk: pd.DataFrame, source_id: int, conn: sqlite3.Connection) -> int:
+    """Insert one chunk into DB. Returns number of rows saved."""
+    norm = _norm_col
+    chunk.columns = [norm(c) for c in chunk.columns]
+    rename = _apply_rename(list(chunk.columns))
+    chunk = chunk.rename(columns=rename)
+
+    has_name  = "name_zh" in chunk.columns or "name_en" in chunk.columns
+    has_price = "price_twd" in chunk.columns
+    if not has_name or not has_price:
+        return 0
+
+    saved = 0
+    # Use vectorised ops instead of iterrows
+    chunk["price_twd"] = pd.to_numeric(chunk.get("price_twd"), errors="coerce")
+    chunk = chunk[chunk["price_twd"].notna() & (chunk["price_twd"] > 0)]
+
+    for col in ["name_zh", "name_en", "generic_name", "atc_code", "dosage_form",
+                "strength", "manufacturer"]:
+        if col not in chunk.columns:
+            chunk[col] = None
+        else:
+            chunk[col] = chunk[col].where(chunk[col].notna(), None)
+
+    for row in chunk.itertuples(index=False):
+        name_zh = str(getattr(row, "name_zh") or "").strip() or None
+        name_en = str(getattr(row, "name_en") or "").strip() or None
+        if not name_zh and not name_en:
+            continue
+
+        drug_id = insert_drug(
+            conn,
+            name_ja=name_zh,
+            name_en=name_en,
+            generic_name=str(getattr(row, "generic_name") or "").strip() or None,
+            atc_code=str(getattr(row, "atc_code") or "").strip() or None,
+            dosage_form=str(getattr(row, "dosage_form") or "").strip() or None,
+            strength=str(getattr(row, "strength") or "").strip() or None,
+            manufacturer=str(getattr(row, "manufacturer") or "").strip() or None,
+            source_id=source_id,
+        )
+        insert_price(
+            conn,
+            drug_id=drug_id,
+            source_id=source_id,
+            country="TWN",
+            price=float(getattr(row, "price_twd")),
+            currency="TWD",
+            unit="per unit",
+        )
+        saved += 1
+    return saved
 
 
 def fetch(conn: sqlite3.Connection) -> None:
@@ -196,84 +276,30 @@ def fetch(conn: sqlite3.Connection) -> None:
         mark_fetched(conn, source_id)
         return
 
+    # Detect encoding/separator from first 64KB only
     try:
-        df = _read_csv(data)
+        enc, sep = _detect_encoding_sep(data)
     except Exception as e:
-        logger.error("NHI parse failed: %s", e)
+        logger.error("NHI encoding detection failed: %s", e)
         mark_fetched(conn, source_id)
         return
 
-    # Normalise column names
-    norm = lambda s: str(s).strip().lower().replace(" ", "").replace("　", "")
-    df.columns = [norm(c) for c in df.columns]
-    logger.info("  Raw columns: %s", list(df.columns)[:20])
-
-    rename_map = {}
-    for col in df.columns:
-        for alias, field in COL_ALIASES.items():
-            if col == norm(alias):
-                rename_map[col] = field
-                break
-    df = df.rename(columns=rename_map)
-    logger.info("  Renamed columns: %s", list(df.columns)[:20])
-
-    has_name  = "name_zh" in df.columns or "name_en" in df.columns
-    has_price = "price_twd" in df.columns
-
-    # Positional fallback: NHI CSV has stable column order
-    # [0]異動 [1]藥品代號 [2]英文名 [3]中文名 [4]成份 [5]規格量 [6]規格單位
-    # [7]單複方 [8]支付價 [9]有效起日 [10]有效迄日 [11]藥廠 [12]製造廠名稱
-    # [13]劑型 [14]藥品分類 [15]分類分組名稱 [16]ATC代碼
-    if not has_name and len(df.columns) >= 9:
-        logger.warning("Column name match failed; using positional fallback")
-        cols = list(df.columns)
-        pos_map = {cols[2]: "name_en", cols[3]: "name_zh",
-                   cols[4]: "generic_name", cols[8]: "price_twd"}
-        if len(cols) > 12: pos_map[cols[12]] = "manufacturer"
-        if len(cols) > 13: pos_map[cols[13]] = "dosage_form"
-        if len(cols) > 16: pos_map[cols[16]] = "atc_code"
-        df = df.rename(columns=pos_map)
-        has_name  = "name_zh" in df.columns or "name_en" in df.columns
-        has_price = "price_twd" in df.columns
-
-    if not has_name or not has_price:
-        logger.error(
-            "NHI: missing required columns. has_name=%s has_price=%s  cols=%s",
-            has_name, has_price, list(df.columns),
+    # Stream-parse in chunks of 5000 rows to stay within memory limits
+    CHUNK = 5000
+    try:
+        reader = pd.read_csv(
+            io.BytesIO(data), encoding=enc, sep=sep,
+            low_memory=False, on_bad_lines="skip",
+            chunksize=CHUNK,
         )
-        mark_fetched(conn, source_id)
-        return
-
-    for _, row in df.iterrows():
-        name_zh = str(row.get("name_zh") or "").strip() or None
-        name_en = str(row.get("name_en") or "").strip() or None
-        if not name_zh and not name_en:
-            continue
-        price_twd = pd.to_numeric(row.get("price_twd"), errors="coerce")
-        if pd.isna(price_twd) or price_twd <= 0:
-            continue
-
-        drug_id = insert_drug(
-            conn,
-            name_ja=name_zh,
-            name_en=name_en,
-            generic_name=str(row.get("generic_name") or "").strip() or None,
-            atc_code=str(row.get("atc_code") or "").strip() or None,
-            dosage_form=str(row.get("dosage_form") or "").strip() or None,
-            strength=str(row.get("strength") or "").strip() or None,
-            manufacturer=str(row.get("manufacturer") or "").strip() or None,
-            source_id=source_id,
-        )
-        insert_price(
-            conn,
-            drug_id=drug_id,
-            source_id=source_id,
-            country="TWN",
-            price=float(price_twd),
-            currency="TWD",
-            unit="per unit",
-        )
-        saved += 1
+        for i, chunk in enumerate(reader):
+            n = _process_chunk(chunk, source_id, conn)
+            saved += n
+            if i % 10 == 0:
+                logger.info("  chunk %d: saved %d so far", i, saved)
+                conn.commit()          # commit every 10 chunks
+    except Exception as e:
+        logger.error("NHI chunked read failed: %s", e)
 
     mark_fetched(conn, source_id)
     logger.info("Taiwan NHI done. Saved %d entries.", saved)

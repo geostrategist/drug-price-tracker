@@ -12,6 +12,7 @@ Sidebar controls:
 """
 import logging
 import io
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -21,12 +22,18 @@ import db
 import ppp as ppp_module
 from scrapers import japan_mhlw, who_ems, oecd_health, worldbank_gdp, taiwan_nhi
 
-# Capture scraper logs so we can show them in the UI
-log_stream = io.StringIO()
+# Log to a file so logs persist across Streamlit reruns
+LOG_FILE = Path(__file__).parent / "data" / "scraper.log"
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(log_stream)],
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(io.StringIO()),   # suppress stderr
+    ],
+    force=True,
 )
 
 # ── page config ───────────────────────────────────────────────────────────────
@@ -103,8 +110,8 @@ def _search(q: str) -> pd.DataFrame:
 
 def _run_scraper(key: str) -> None:
     label, fn = SCRAPERS[key]
-    log_stream.truncate(0)
-    log_stream.seek(0)
+    # Record log file size before running so we can show only new lines
+    log_start = LOG_FILE.stat().st_size if LOG_FILE.exists() else 0
     with st.spinner(f"正在抓取 {label} …"):
         try:
             with db.get_conn() as conn:
@@ -112,10 +119,14 @@ def _run_scraper(key: str) -> None:
             st.success(f"✅ {label} 完成")
         except Exception as exc:
             st.error(f"❌ {label} 失敗：{exc}")
-    logs = log_stream.getvalue()
-    if logs:
-        with st.expander("📋 執行記錄", expanded=("error" in logs.lower() or "failed" in logs.lower())):
-            st.code(logs, language="")
+    # Show only the log lines produced by this run
+    if LOG_FILE.exists():
+        with open(LOG_FILE, encoding="utf-8", errors="replace") as _lf:
+            _lf.seek(log_start)
+            new_logs = _lf.read()
+        if new_logs.strip():
+            with st.expander("📋 執行記錄", expanded=("error" in new_logs.lower() or "failed" in new_logs.lower())):
+                st.code(new_logs, language="")
     st.cache_data.clear()
 
 
@@ -380,8 +391,12 @@ with tab_debug:
             st.warning("找不到台灣健保藥價資料（country='TWN'）。")
 
     st.markdown("**執行記錄**")
-    logs = log_stream.getvalue()
-    if logs:
-        st.code(logs[-3000:], language="")
+    if LOG_FILE.exists():
+        with open(LOG_FILE, encoding="utf-8", errors="replace") as _lf:
+            all_logs = _lf.read()
+        if all_logs.strip():
+            st.code(all_logs[-4000:], language="")
+        else:
+            st.caption("記錄檔為空，請先執行抓取。")
     else:
         st.caption("尚無記錄，請先執行抓取。")
