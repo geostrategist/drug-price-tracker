@@ -20,7 +20,7 @@ import streamlit as st
 
 import db
 import ppp as ppp_module
-from scrapers import japan_mhlw, who_ems, oecd_health, worldbank_gdp, taiwan_nhi
+from scrapers import japan_mhlw, who_ems, oecd_health, worldbank_gdp, taiwan_nhi, us_cms_nadac
 
 # Log to a file so logs persist across Streamlit reruns
 LOG_FILE = Path(__file__).parent / "data" / "scraper.log"
@@ -53,6 +53,7 @@ SCRAPERS = {
     "who":       ("🏥 WHO/HAI 藥品調查",      who_ems.fetch),
     "mhlw":      ("🇯🇵 日本厚生勞動省",       japan_mhlw.fetch),
     "oecd":      ("📊 OECD 藥品支出",         oecd_health.fetch),
+    "us":        ("🇺🇸 美國 FDA Orange Book", us_cms_nadac.fetch),
 }
 
 # ── cached queries ─────────────────────────────────────────────────────────────
