@@ -8,12 +8,14 @@ Fetches drug pricing data from:
   - OECD Health Statistics – Pharmaceutical Expenditure
   - World Bank GDP per capita PPP (all countries)
   - Taiwan NHI 藥品給付支付標準
+  - U.S. CMS NADAC (National Average Drug Acquisition Cost, USD/unit)
 
 Usage:
   python main.py fetch                    # fetch all sources
   python main.py fetch mhlw who oecd      # fetch specific sources
   python main.py fetch worldbank          # fetch World Bank GDP PPP
   python main.py fetch nhi                # fetch Taiwan NHI prices
+  python main.py fetch us                 # fetch U.S. CMS NADAC prices
   python main.py show                     # summary of stored data
   python main.py search <name>            # search for a drug by name
   python main.py ppp                      # PPP-corrected comparison table
@@ -32,7 +34,7 @@ import pandas as pd
 import db
 import ppp as ppp_module
 from scrapers import japan_mhlw, who_ems, oecd_health
-from scrapers import worldbank_gdp, taiwan_nhi
+from scrapers import worldbank_gdp, taiwan_nhi, us_cms_nadac
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +49,7 @@ SCRAPERS = {
     "oecd":      oecd_health.fetch,
     "worldbank": worldbank_gdp.fetch,
     "nhi":       taiwan_nhi.fetch,
+    "us":        us_cms_nadac.fetch,
 }
 
 
